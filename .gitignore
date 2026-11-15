@@ -1,0 +1,9 @@
+# Large / regenerable files that are kept locally, not in git
+*.zip
+*_frame_cache/
+*_frame_cache*
+Characters/
+# generated animation frames (e.g. Cerberus_Attack_1_L_001.png)
+*_[0-9][0-9][0-9].png
+.DS_Store
+Thumbs.db

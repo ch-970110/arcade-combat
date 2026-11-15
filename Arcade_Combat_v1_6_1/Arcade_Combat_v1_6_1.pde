@@ -1,0 +1,1242 @@
+import processing.video.*;
+
+// --- GLOBAL CONSTANTS & CONFIG ---
+final float BASE_HP = 2000;
+long lastGlobalInvuln = -5000; // Track the 5-second cooldown
+Player p1, p2;
+ArrayList<LogEntry> combatLog = new ArrayList<LogEntry>();
+
+// DODGE SETTINGS
+final float STAMINA_REGEN = 0.25; 
+
+// SCROLL LOG SETTINGS
+float logScroll = 0;
+float logMaxScroll = 0;
+
+String[] allItemNames = {
+  "Mjölnir", 
+  "Cloak_of_Midnight", 
+  "Golden_Bell_Shield_and_Iron_Cloth", 
+  "Excalibur",
+  "Blood_of_Satan", 
+  "Holy_Water", 
+  "Crown_of_Ember_Sovereign", 
+  "Grimoire_d'Archimage",
+  "Paladin's_Shield",
+  "Reaper_Sickle",
+  "Bursting_Scepter",
+  "Warden's_Thornplate",
+  "Crimson_Bloodreaver",
+  "Heart_of_Verdant_Core"
+};
+PImage[] allImages = new PImage[14];
+PImage[] codImages = new PImage[6];
+String[] codArchetypes = {"Water", "Fire", "Thunder", "Earth", "Holy", "Dark"};
+
+int[] p1Loadout = {-1,-1,-1,-1}, p2Loadout = {-1,-1,-1,-1};
+int draggedItemIdx = -1;
+boolean draggingFromP1 = false, draggingFromP2 = false; 
+int dragSourceSlot = -1;
+
+float sideWidth, videoHeight, logY, loadoutY, libraryY;
+boolean p1Summoned = false;
+boolean p2Summoned = false; 
+boolean p1IsAttacking = false;
+boolean p2IsAttacking = false;
+boolean p1IsDodging = false;
+boolean p2IsDodging = false;
+
+float p1Stamina = 100, p2Stamina = 100;
+
+class LogEntry {
+  String main, effect;
+  int physDmg, magDmg, trueDmg, healVal;
+  color mainCol, effCol; 
+  
+  LogEntry(String m, int pD, int mD, int tD, int hV, String e, color mc, color ec) { 
+    main = m; physDmg = pD; magDmg = mD; trueDmg = tD; healVal = hV; effect = e;
+    mainCol = mc; effCol = ec; 
+  }
+}
+
+void setup() {
+  size(960, 600); 
+  calculateLayout();
+  p1 = new Player(1, "Thunderbird", "Thunder", this); 
+  p2 = new Player(2, "Hydra", "Water", this);   
+
+  for (int i = 0; i < allItemNames.length; i++) {
+    allImages[i] = loadImage(allItemNames[i] + ".png");
+  }
+  for (int i = 0; i < codArchetypes.length; i++) {
+    codImages[i] = loadImage("CoD_" + codArchetypes[i] + ".jpeg");
+  }
+}
+
+color getPlayerColor(String archetype) {
+  if (archetype.equals("Thunder")) return color(100, 200, 255); // Lightning Cyan
+  if (archetype.equals("Fire"))    return color(255, 120, 50);  // Flame Orange
+  if (archetype.equals("Dark"))    return color(160, 50, 255);  // Void Purple
+  if (archetype.equals("Holy"))    return color(255, 240, 150); // Radiant Yellow
+  if (archetype.equals("Water"))   return color(50, 150, 255);  // Deep Blue
+  if (archetype.equals("Earth"))   return color(180, 140, 90);  // Earthen Brown
+  return color(200); // Default System Gray
+}
+
+class Player {
+  int id; String type; String name;
+  Movie idleVid, atkVid, dgeVid, koVid;
+  float HP, maxHP, dispHP, animHP;
+  long lastAtk = -5000; 
+  int[] items = new int[4];
+  boolean isDead = false;
+  boolean koFinished = false; // Tracks if the KO sequence is complete
+  float pendingHeal = 0;
+  long dizzyStartTime = 0;
+  long dizzyEndTime = 0;        // Timestamp when the stun state expires
+  float dizzyRedu = 0;          // Total percentage reduction (e.g., 0.15 = 15% shorter stuns)
+  boolean isDizzyImmune = false; // Set to true if wearing Paladin's Shield
+  
+  // TELEGRAPH COMBAT QUEUE
+  Player incomingAttacker = null;
+  float incomingPhysDamage = 0;
+  float incomingMagDamage = 0;
+  float incomingTrueDamage = 0;
+  String incomingProcs = "";
+  boolean incomingDodgeSuccess = false;
+  long attackLandTime = 0;
+  
+  // Track item passive triggers per round
+  boolean cloakTriggeredThisRound = false;
+  boolean goldenBellTriggeredThisRound = false;
+  boolean satanTriggeredThisRound = false;
+  int crownHitCounter = 0; // For Crown of Ember Sovereign
+  int verdantHitCounter = 0; // For Heart of Verdant Core
+  
+  boolean isDizzy() {
+    return millis() < dizzyEndTime && !isDead;
+  }
+  
+  Player(int id, String name, String type, PApplet sketch) {
+    this.id = id; this.name = name; this.type = type;
+    this.maxHP = BASE_HP;
+    this.HP = maxHP; this.dispHP = maxHP; this.animHP = maxHP;
+    
+    for (int i = 0; i < this.items.length; i++) {
+      this.items[i] = -1;
+    }
+  
+  
+  // Safely pull the correct direction suffix depending on screen side
+    String side = (id == 1) ? "_L.mp4" : "_R.mp4";
+    
+  try {
+      // Automatically looks for files named like "Cerberus_IDLE_L.mp4" or "Cerberus_IDLE_R.mp4"
+      idleVid = new Movie(sketch, name + "_IDLE" + side);
+      atkVid  = new Movie(sketch, name + "_Attack_1" + side);
+      dgeVid  = new Movie(sketch, name + "_Dodge" + side);
+      koVid   = new Movie(sketch, name + "_KO" + side);
+    } catch (Exception e) {
+      println("Error loading video files for character: " + name);
+    }
+  }
+  
+  void resetPlayer() {
+    this.HP = this.maxHP;
+    this.dispHP = this.maxHP;
+    this.animHP = this.maxHP;
+    this.pendingHeal = 0;
+    
+    this.isDead = false;
+    this.koFinished = false;
+    this.dizzyStartTime = 0;
+    this.dizzyEndTime = 0;
+    this.incomingAttacker = null;
+    
+    this.cloakTriggeredThisRound = false;
+    this.goldenBellTriggeredThisRound = false;
+    this.satanTriggeredThisRound = false;
+    this.crownHitCounter = 0;
+    this.verdantHitCounter = 0;
+    
+    if (idleVid != null) idleVid.stop();
+    if (atkVid != null)  atkVid.stop();
+    if (dgeVid != null)  dgeVid.stop();
+    if (koVid != null)   koVid.stop();
+  }
+
+  
+  void recalculateStats() {
+    float oldMaxHP = maxHP;
+    
+    // Change baseMaxHP to BASE_HP here:
+    float tempMax = BASE_HP; 
+    if (hasEquipped("Golden_Bell_Shield_and_Iron_Cloth")) tempMax += 400;
+    if (hasEquipped("Paladin's_Shield"))                  tempMax += 300;
+    if (hasEquipped("Heart_of_Verdant_Core"))             tempMax += 200;
+    
+    maxHP = tempMax;
+    
+    float hpDifference = maxHP - oldMaxHP;
+    HP += hpDifference;
+    
+    if(HP <= 0) HP = 1;
+    if(HP > maxHP) HP = maxHP;
+  }
+
+  void sync(int[] l) { 
+    this.items = l; 
+    float oldMaxHP = this.maxHP;
+    
+    // Reset modifiers before checking current loadout
+    float bonusHP = 0;
+    this.dizzyRedu = 0.0;
+    this.isDizzyImmune = false;
+    
+    if (hasEquipped("Golden_Bell_Shield_and_Iron_Cloth")) bonusHP += 400;
+    if (hasEquipped("Paladin's_Shield"))                  { bonusHP += 300; this.isDizzyImmune = true; } // Aligned with v2.5
+    if (hasEquipped("Heart_of_Verdant_Core"))             { bonusHP += 200; this.dizzyRedu += 0.10; }    // Aligned with v2.5
+    
+    if (hasEquipped("Cloak_of_Midnight"))                 this.dizzyRedu += 0.05;                        // Aligned with v2.5
+    if (hasEquipped("Holy_Water"))                        this.dizzyRedu += 0.10;     // Aligned with v2.5
+    
+    this.maxHP = BASE_HP + bonusHP;
+    
+    float HPDiff = this.maxHP - oldMaxHP;
+    this.HP += HPDiff;
+    
+    if (this.HP <= 0) this.HP = 1; 
+    if (this.HP > this.maxHP) this.HP = this.maxHP; 
+  }
+  
+  void applyDizzy(float durationSec) {
+    if (isDizzyImmune || isDead) return; 
+    
+    float actualDuration = durationSec * (1.0 - dizzyRedu);
+    long stunDurationMs = (long)(actualDuration * 1000);
+    
+    // Record the exact start time of this stun window
+    dizzyStartTime = millis();
+    dizzyEndTime = dizzyStartTime + stunDurationMs;
+    
+    if (this.id == 1) {
+      p1IsAttacking = false;
+      p1IsDodging = false;
+    } else {
+      p2IsAttacking = false;
+      p2IsDodging = false;
+    }
+    
+    if (atkVid != null) atkVid.stop();
+    if (dgeVid != null) dgeVid.stop();
+    if (idleVid != null) {
+      idleVid.jump(0);
+      idleVid.loop();
+    }
+  
+    logCombat("SYS: P" + id + " DIZZY", 0, 0, 0, 0, "{" + nf(actualDuration, 1, 1) + "s Stun}", color(230));
+  }
+  
+  boolean triggerAbsoluteDefense() {
+    if (millis() - lastGlobalInvuln >= 5000) {
+        lastGlobalInvuln = millis();
+        // Corrected 'defenderColor' to a valid class-accessible call:
+        //logCombat("SYS: P" + id + " ABS. DEFENSE", 0, 0, 0, 0, "{INVULNERABLE}", getPlayerColor(this.type));
+        return true; 
+    }
+    return false;
+  }
+
+  float getSpeedMult() {
+  float s = 1.0;
+  if (type.equals("Thunder")) s += 0.3;
+  for (int i : items) {
+     if (i != -1) {
+       String n = allItemNames[i];
+       if (n.equals("Mjölnir")) s += 0.1;
+       if (n.equals("Reaper_Sickle")) s += 0.15;
+       if (n.equals("Blood_of_Satan")) s += 0.25;
+       if (n.equals("Crown_of_Ember_Sovereign")) s += 0.10;
+     }
+  }
+  return s;
+}
+
+  float getInterval() {
+    float duration = (float)atkVid.duration();
+    if (duration <= 0) duration = 1.2; 
+    return max(0.2, (duration - 0.15) / getSpeedMult());
+  }
+
+
+  void update() {
+    // ONLY process heals if the player is still alive
+    if (pendingHeal > 0 && !isDead) {
+       float healStep = min(pendingHeal, maxHP * 0.05); //min(pendingHeal, 2.0); 
+       HP = min(maxHP, HP + healStep);
+       pendingHeal -= healStep;
+    }
+    
+    if (incomingAttacker != null && millis() >= attackLandTime) {
+       if (!isDead) resolveHit();
+       else { incomingAttacker = null; incomingDodgeSuccess = false; }
+    }
+    
+    dispHP = lerp(dispHP, HP, 0.1);
+    animHP = lerp(animHP, HP, 0.05);
+
+    // Trigger KO 
+    if (HP <= 0 && !isDead) { 
+      isDead = true; 
+      koFinished = false; 
+      HP = 0; 
+      pendingHeal = 0; // Wipe out any lingering regeneration
+      
+      idleVid.stop(); atkVid.stop(); dgeVid.stop();
+      koVid.jump(0); koVid.play();
+      
+      logCombat("SYS: P" + id + " KO'd!", 0, 0, 0, 0, "{DEFEATED}", color(255, 50, 50));
+    }
+    
+    // Force HP to stay exactly at 0 while dead (prevents visual glitches)
+    if (isDead) {
+      HP = 0; 
+    }
+  }
+
+  void launchAttack(Player def) {
+    float baseStrike = 400; // Base strike
+    float physTotal = 0;
+    float magTotal = 0;
+    float trueDmgBonus = 0;
+    String procs = "";
+    
+    // Holy Water calculation booster (+20 percentile)
+    float bonusChance = hasEquipped("Holy_Water") ? 0.20 : 0.0;
+    
+    if (hasEquipped("Mjölnir"))               baseStrike += 150;
+    if (hasEquipped("Excalibur"))             baseStrike += 200;
+
+    // A. Archetype Passives
+    if (type.equals("Fire") || type.equals("Thunder") || type.equals("Earth") || type.equals("Water")) {
+      physTotal = baseStrike;
+    } else if (type.equals("Dark") || type.equals("Holy")) {
+      magTotal = baseStrike;
+    }
+    
+    if (type.equals("Fire")) physTotal *= 1.20;
+    if (type.equals("Dark")) magTotal *= 1.25;
+    
+    // Add weapon flat true damage properties
+    if (hasEquipped("Excalibur"))             trueDmgBonus += 50;
+    if (hasEquipped("Blood_of_Satan"))        trueDmgBonus += 50;
+    if (hasEquipped("Grimoire_d'Archimage"))  trueDmgBonus += 50;
+
+    // B. The Elemental Hexagon 
+    if ((type.equals("Thunder") && def.type.equals("Water")) ||
+        (type.equals("Water") && def.type.equals("Fire")) ||
+        (type.equals("Fire") && def.type.equals("Earth")) ||
+        (type.equals("Earth") && def.type.equals("Thunder"))) {
+        if (physTotal > 0) physTotal *= 1.15;
+        if (magTotal > 0) magTotal *= 1.15; // Advantage 
+    } else if ((type.equals("Water") && def.type.equals("Thunder")) ||
+               (type.equals("Fire") && def.type.equals("Water")) ||
+               (type.equals("Earth") && def.type.equals("Fire")) ||
+               (type.equals("Thunder") && def.type.equals("Earth"))) {
+        if (physTotal > 0) physTotal *= 0.90;
+        if (magTotal > 0) magTotal *= 0.90; // Disadvantage 
+    }
+
+    // C. The Chaos Axis 
+    if ((type.equals("Holy") && def.type.equals("Dark")) || (type.equals("Dark") && def.type.equals("Holy"))) {
+        if (physTotal > 0) physTotal *= 1.50;
+        if (magTotal > 0) magTotal *= 1.50; // Mutual Destruction 
+        procs += "{CHAOS}";
+    }
+    
+    // D. Item Procs
+    boolean mjolnirTriggered = false;
+    if (hasEquipped("Mjölnir")) {
+        float procChance = (type.equals("Thunder") ? 0.30 : 0.20) + bonusChance; 
+        if (random(1) < procChance) { 
+          physTotal *= 1.20; // Corrected: +20% physical dmg
+          procs += "{God of Thunder}"; 
+          mjolnirTriggered = true;
+        }
+    }
+    if (hasEquipped("Excalibur")) {
+        if (random(1) < (0.30 + bonusChance)) { 
+          trueDmgBonus += (physTotal * 0.30); // Corrected: +30% true dmg
+          procs += "{Rightful King}"; 
+        }
+    }
+    if (hasEquipped("Reaper_Sickle")) {
+        trueDmgBonus += 125;  
+      }
+    if (hasEquipped("Crown_of_Ember_Sovereign")) {
+        magTotal *= 1.30; // +30% mag dmg passive
+        crownHitCounter++;
+        if (crownHitCounter % 3 == 0) {
+          magTotal += 200; // Infernal Dominion proc
+          procs += "{Infernal Dominion}";
+        }
+    }
+    if (hasEquipped("Grimoire_d'Archimage")) {
+        magTotal +=200;
+        trueDmgBonus += 50;
+    }
+    if (hasEquipped("Bursting_Scepter")) {
+      magTotal += 100;
+      procs += "{Overload}";
+    }
+    
+    def.incomingAttacker = this;
+    def.incomingPhysDamage = physTotal;
+    def.incomingMagDamage = magTotal;
+    def.incomingTrueDamage += trueDmgBonus;
+    def.incomingProcs = procs;
+    
+    if (mjolnirTriggered) def.incomingProcs += "{Lightning Strike}";
+    def.attackLandTime = millis() + (long)(this.getInterval() * 1000);
+  }
+
+
+  void resolveHit() {
+    if (incomingAttacker == null) return;
+    color attackerColor = getPlayerColor(incomingAttacker.type);
+    color defenderColor = getPlayerColor(this.type);
+    if (incomingDodgeSuccess) {
+        logCombat("SYS: P" + id + " EVADED", 0, 0, 0, 0, "{Dodged}", defenderColor);
+        incomingAttacker = null;
+        incomingTrueDamage = 0;
+        incomingPhysDamage = 0;
+        incomingMagDamage = 0;
+        incomingDodgeSuccess = false;
+        return;
+    }
+
+    float finalPhys = incomingPhysDamage;
+    float finalMag = incomingMagDamage;
+    boolean bypassAbsDef = incomingAttacker.hasEquipped("Reaper_Sickle");
+
+
+    // 2. PHYSICAL DAMAGE CALCULATIONS
+    float flatPhysRedu = 0;
+    if (hasEquipped("Paladin's_Shield")) flatPhysRedu += 150;
+    //if (hasEquipped("Warden's_Thornplate")) flatPhysRedu += 200; // Flat mitigation component
+    finalPhys = max(incomingPhysDamage * 0.25, finalPhys - flatPhysRedu);
+    
+    float physMult = 1.0;
+    if (type.equals("Holy")) physMult *= 0.85; 
+    if (hasEquipped("Golden_Bell_Shield_and_Iron_Cloth")) physMult *= 0.80; // 20% phys redu
+    if (hasEquipped("Holy_Water")) physMult *= 0.85; // 15% all redu
+    if (hasEquipped("Warden's_Thornplate")) physMult *= 0.85;
+    finalPhys *= physMult;
+
+    // 3. MAGICAL DAMAGE CALCULATIONS
+    float flatMagRedu = 0;
+    /*if (hasEquipped("Warden's_Thornplate")) {
+      flatMagRedu += 200;
+    }*/
+    finalMag = max(incomingMagDamage * 0.25, finalMag - flatMagRedu);
+
+    float magMult = 1.0;
+    if (type.equals("Holy"))              magMult *= 0.85; 
+    if (hasEquipped("Cloak_of_Midnight")) magMult *= 0.85; // 15% Mag Redu 
+    if (hasEquipped("Holy_Water"))        magMult *= 0.85; // 15% All Redu 
+    if (hasEquipped("Warden's_Thornplate")) magMult += 0.85;
+    finalMag *= magMult;
+
+    // 4. COMBINATION & EXECUTION
+    float finalDmg = finalPhys + finalMag;
+    float totalCombinedDamage =  finalDmg+ incomingTrueDamage;
+    
+    // 1. STRATA: Absolute Defense
+    if (!bypassAbsDef) {
+        float totalCombinedIncoming = finalPhys + finalMag;
+        if (hasEquipped("Cloak_of_Midnight") && !cloakTriggeredThisRound && totalCombinedIncoming > (HP * 0.20)) {
+          if (triggerAbsoluteDefense()) {
+            cloakTriggeredThisRound = true;
+            logCombat("SYS: P" + id + " ABS. DEFENSE", 0, 0, 0, 0, "{Vanish}", defenderColor);
+            incomingAttacker = null; 
+            return;  
+          }
+        }
+        
+        if (hasEquipped("Golden_Bell_Shield_and_Iron_Cloth") && !goldenBellTriggeredThisRound && HP < (maxHP * 0.10)) {
+          if (triggerAbsoluteDefense()) {
+            goldenBellTriggeredThisRound = true;
+            logCombat("SYS: P" + id + " ABS. DEFENSE", 0, 0, 0, 0, "{Nine Yang Sutra}", defenderColor);
+            incomingAttacker = null; 
+            return;
+          }
+        }
+    }
+    
+    if (incomingAttacker.hasEquipped("Reaper_Sickle") && HP < maxHP * 0.15) {
+        if (random(1) < 0.25) { 
+          HP = 0; 
+          logCombat("SYS: P" + id + " EXECUTES P" + incomingAttacker.id , 0, 0, 0, 0, "{Harvest of Death}", color(255,0,0)); 
+          incomingAttacker = null; 
+          return;
+        }
+    }
+
+    // 5. Thorns Reflection
+    if (hasEquipped("Warden's_Thornplate")) {
+        float reflect = finalPhys * 0.10;
+        if (!incomingAttacker.isDead) {
+          incomingAttacker.HP = max(0, incomingAttacker.HP - reflect);
+          if (incomingAttacker.HP <= 0) {
+            incomingAttacker.HP = 0;
+            incomingAttacker.isDead = true;
+            incomingAttacker.koFinished = false;
+            incomingAttacker.idleVid.stop();
+            incomingAttacker.atkVid.stop();
+            incomingAttacker.dgeVid.stop();
+            incomingAttacker.koVid.jump(0);
+            incomingAttacker.koVid.play();
+            logCombat("SYS: P" + incomingAttacker.id + " KO'd via Thorns!", 0, 0, 0, 0, "{DEFEATED}", color(255, 50, 50));
+          }
+        }
+        logCombat("SYS: P" + id + " REFLECTS P " + incomingAttacker.id, 0, 0, (int)reflect, 0, "{Thorny Spikes}", defenderColor);
+    }
+
+    // Apply Damage
+    HP -= totalCombinedDamage;
+    
+    // Heart of Verdant Core: On-Hit Random Regeneration Matrix
+    if (hasEquipped("Heart_of_Verdant_Core")) {
+        verdantHitCounter++;
+        if (verdantHitCounter % 3 == 0) {
+            float randRegen = random(50, 100); // Randomly regenerate 50~100 HP
+            HP = min(maxHP, HP + randRegen);
+            logCombat("SYS: P" + id + " REGEN", 0, 0, 0, (int)randRegen, "{Eternal Spring}",defenderColor);
+        }
+    }
+
+    // 6. Dizzy Mechanics Core Procs
+    if (!isDead) {
+        float bonusChance = incomingAttacker.hasEquipped("Holy_Water") ? 0.20 : 0.0;
+        if (incomingAttacker.hasEquipped("Mjölnir") && incomingAttacker.type.equals("Thunder") && incomingProcs.contains("{Lightning Strike}")) {
+            if (random(1) < (0.30 + bonusChance)) applyDizzy(5.0);
+        }
+        if (incomingAttacker.hasEquipped("Bursting_Scepter")) {
+            if (random(1) < (0.30 + bonusChance)) applyDizzy(5.0); 
+        }
+    }
+
+    // 7. Life Steal (Lifesteal recalculations based on v2.5 Rules)
+    float lstealPercent = 0;
+    String lstealName = "";
+
+    if (incomingAttacker.hasEquipped("Grimoire_d'Archimage")) {
+        lstealPercent = 0.15;
+        lstealName = "{Life Magic}";
+    } else if (incomingAttacker.hasEquipped("Bursting_Scepter")) {
+        lstealPercent = 0.10;
+        lstealName = "{Overload}";
+    } else if (incomingAttacker.hasEquipped("Crimson_Bloodreaver")) {
+        lstealPercent = (HP < (maxHP * 0.30)) ? 0.30 : 0.15; // Doubles if target health is < 30%
+        lstealName = "{Blood Thirsty}";
+    }
+
+    // Satan Frenzy override check
+    if (incomingAttacker.hasEquipped("Blood_of_Satan") && !incomingAttacker.satanTriggeredThisRound) {
+        if (incomingAttacker.HP < (incomingAttacker.maxHP * 0.10)) {
+            incomingAttacker.satanTriggeredThisRound = true;
+            lstealPercent = 1.00; // 100% life steal
+            lstealName = "{Frenzy}";
+        }
+    }
+
+    if (lstealPercent > 0) {
+        float lstealVal = finalDmg * lstealPercent;
+        incomingAttacker.pendingHeal += lstealVal;
+        logCombat("SYS: P" + incomingAttacker.id + " HEAL", 0, 0, 0, (int)lstealVal, lstealName, attackerColor);
+    }
+
+    // Log Output Formatting
+    /*color typeColor = incomingAttacker.type.equals("Thunder") ? color(100, 200, 255) : color(255, 120, 50);
+    String regDmgStr = "[" + (int)finalDmg + "]";
+    String trueDmgStr = (incomingTrueDamage > 0) ? "{" + (int)incomingTrueDamage + "}" : "";*/
+    logCombat("P" + incomingAttacker.id + " -> P" + id, (int)finalPhys, (int)finalMag, (int)incomingTrueDamage, 0, incomingProcs, attackerColor);
+
+    incomingAttacker = null;
+    incomingTrueDamage = 0;
+    incomingDodgeSuccess = false;
+  }
+
+  void tryDodge() {
+    if (incomingAttacker != null) {
+      long attackStart = incomingAttacker.lastAtk;
+      long halfWindow = (long)((incomingAttacker.getInterval() * 1000) / 2.0);
+      
+      if (millis() <= attackStart + halfWindow) {
+        incomingDodgeSuccess = true;
+      }
+    }
+  }
+
+  boolean hasEquipped(String n) {
+    for(int i : items) if (i!=-1 && allItemNames[i].equals(n)) return true;
+    return false;
+  }
+}
+
+
+void draw() {
+  background(15);
+  
+  // ==========================================================
+  // 1. INDEPENDENT STAMINA MATH & UPDATES (Runs per player if summoned)
+  // ==========================================================
+  if (p1Summoned && p1 != null) {
+    if (p1IsDodging && p1.dgeVid != null && p1.dgeVid.duration() > 0) {
+      p1Stamina = constrain(100 - (p1.dgeVid.time() / p1.dgeVid.duration()) * 100, 0, 100);
+    } else if (!p1.isDead && !p1IsDodging) {
+      p1Stamina = min(100, p1Stamina + STAMINA_REGEN);
+    }
+    p1.update(); 
+    drawChar(p1, p1Summoned, p1IsAttacking, p1IsDodging, 0, 0);
+    drawHUD(p1, 20, videoHeight + 20, p1Stamina, p1Summoned, p1IsAttacking);
+    
+    if (p1.isDead && p1.koFinished) { 
+      fill(255, 50, 50); textSize(50); textAlign(CENTER); 
+      text("K. O.", sideWidth / 2, videoHeight / 2); textAlign(LEFT); 
+    }
+  }
+
+  if (p2Summoned && p2 != null) {
+    if (p2IsDodging && p2.dgeVid != null && p2.dgeVid.duration() > 0) {
+      p2Stamina = constrain(100 - (p2.dgeVid.time() / p2.dgeVid.duration()) * 100, 0, 100);
+    } else if (!p2.isDead && !p2IsDodging) {
+      p2Stamina = min(100, p2Stamina + STAMINA_REGEN);
+    }
+    p2.update();
+    drawChar(p2, p2Summoned, p2IsAttacking, p2IsDodging, sideWidth, 0);
+    drawHUD(p2, width - 320, videoHeight + 20, p2Stamina, p2Summoned, p2IsAttacking);
+    
+    if (p2.isDead && p2.koFinished) { 
+      fill(255, 50, 50); textSize(50); textAlign(CENTER); 
+      text("K. O.", sideWidth + (sideWidth / 2), videoHeight / 2); textAlign(LEFT); 
+    }
+  }
+
+  // ==========================================================
+  // 2. SELECTION INSTRUCTIONS (Only shows if someone isn't summoned)
+  // ==========================================================
+  if (!p1Summoned || !p2Summoned || p1 == null || p2 == null) {
+    textAlign(CENTER, CENTER);
+    textSize(24);
+    fill(255);
+    text("CHARACTER SELECTION SCREEN", width/2, videoHeight/2 - 30);
+    textSize(16);
+    fill(170);
+    
+    // Show instruction only if that specific player needs summoning
+    if (!p1Summoned) text("Player 1: Press 'W' to Summon P1 Character", width/2, videoHeight/2 + 15);
+    if (!p2Summoned) text("Player 2: Press 'I' to Summon P2 Character", width/2, videoHeight/2 + 45);
+  }
+
+  // ==========================================================
+  // 3. UI & MENUS (Always drawing in background/foreground layouts)
+  // ==========================================================
+  drawCombatLog(logY);
+  drawEffectSummary(p1, 10, logY);
+  drawEffectSummary(p2, width - 210, logY);
+  drawLoadoutSlots(loadoutY);
+  drawLibrary(libraryY);
+  drawDominanceIndicators();
+  
+  if (draggedItemIdx != -1) { 
+    imageMode(CENTER); 
+    image(allImages[draggedItemIdx], mouseX, mouseY, 40, 40); 
+    imageMode(CORNER); 
+  }
+
+  // ==========================================================
+  // 4. MATCH COMPLETE OVERLAY (Only prompts if game is legitimately over)
+  // ==========================================================
+  if (p1 != null && p2 != null && ((p1.isDead && p1.koFinished) || (p2.isDead && p2.koFinished))) {
+    fill(0, 0, 0, 200); rect(0, 0, width, height);
+    textAlign(CENTER, CENTER);
+    textSize(40); fill(255, 50, 50);
+    String victoryText = p1.isDead ? "PLAYER 2 WINS!" : "PLAYER 1 WINS!";
+    text(victoryText, width / 2, height / 2 - 30);
+    textSize(18); fill(255);
+    text("Press [ SPACEBAR ] to Start New Round", width / 2, height / 2 + 30);
+  }
+}
+
+
+void drawHUD(Player p, float x, float y, float stam, boolean summ, boolean currentlyAtking) {
+  // Stroke indicates dodge window success
+  if (p.incomingDodgeSuccess) { stroke(0, 255, 255); strokeWeight(3); } else { noStroke(); }
+  
+  // Main Status Box Background
+  fill(summ ? 30 : 10); rect(x, y, 300, 18, 5);
+  noStroke(); 
+  
+  if (summ) { 
+    fill(40); rect(x, y, 300, 18, 5); 
+    
+    if (p.maxHP - p.animHP < 1.0) p.animHP = p.maxHP;
+    if (p.maxHP - p.dispHP < 1.0) p.dispHP = p.maxHP;
+    
+    // --- DYNAMIC DIZZY BAR / HP BAR SWAP ---
+    if (p.isDizzy()) {
+      float remainingMs = max(0, p.dizzyEndTime - millis());
+      float totalStunMs = max(1, p.dizzyEndTime - p.dizzyStartTime);
+      
+      // Calculate remaining percentage (fully synchronized progress factor)
+      float dizzyProg = constrain(remainingMs / totalStunMs, 0, 1);
+      
+      // Render Dizzy Coolbar (Drains linearly to 0 width synchronously)
+      fill(255); 
+      rect(x, y, 300 * dizzyProg, 18, 5);
+      
+      // Update Text Overlay for Status
+      fill(0); textSize(11); 
+      text("STUNNED", x + 10, y + 13);
+      
+      textAlign(RIGHT); 
+      text(nf(remainingMs / 1000.0, 1, 1) + "s", x + 290, y + 13);
+      textAlign(LEFT);
+      
+    } else {
+      // Standard HP rendering logic when player is functional
+      float HPPercent = p.HP / p.maxHP;
+      color HPColor;
+      if (HPPercent <= 0.20)      HPColor = color(255, 50, 50);   // Red
+      else if (HPPercent <= 0.50) HPColor = color(255, 230, 0);  // Yellow
+      else                        HPColor = color(50, 200, 50);   // Grass Green
+      
+      // Ghosting damage tracking
+      if (p.HP < p.dispHP) {
+        fill(200, 150, 0, 150);
+        rect(x, y, map(p.dispHP, 0, p.maxHP, 0, 300), 18, 5);
+      }
+      
+      fill(HPColor); 
+      rect(x, y, map(p.HP, 0, p.maxHP, 0, 300), 18, 5);
+      
+      fill(255); textSize(12); text("P" + p.id + " HP", x, y - 5);
+      textAlign(RIGHT); text(Math.round(p.animHP) + " / " + Math.round(p.maxHP), x + 300, y - 5);
+      textAlign(LEFT);
+    }
+  }
+
+  // --- DARKNESS MODIFIER FOR LOWER SYSTEM BARS ---
+  boolean dimBars = p.isDizzy();
+
+  float barW = 145, gap = 10;
+  float atkProg = constrain((millis() - p.lastAtk) / (p.getInterval() * 1000), 0, 1);
+  
+  // Attack Bar Background
+  fill(dimBars ? 15 : 40); rect(x, y + 22, barW, 8, 4);
+  boolean ready = (atkProg >= 1.0 && !currentlyAtking && !p.isDead);
+  
+  // Apply Attack Bar Color (Dimmed out if Stunned)
+  if (dimBars) {
+    fill(70, 20, 20); 
+  } else if (ready) {
+    fill(255, 100 + (int)(sin(millis()*0.01)*50), 100); 
+  } else {
+    fill(200, 40, 40); 
+  }
+  rect(x, y + 22, barW * atkProg, 8, 4);
+  
+  // Stamina Bar Background
+  fill(dimBars ? 15 : 40); rect(x + barW + gap, y + 22, barW, 8, 4);
+  
+  // Apply Stamina Bar Color (Dimmed out if Stunned)
+  if (dimBars) {
+    fill(20, 45, 80); 
+  } else {
+    fill(50, 150, 255);
+  }
+  rect(x + barW + gap, y + 22, map(stam, 0, 100, 0, barW), 8, 4);
+}
+
+void keyPressed() {
+  // 1. MATCH OVER OVERLAY CHECK
+  if (p1 != null && p2 != null && (p1.isDead || p2.isDead)) {
+    if (key == ' ') {
+      resetToCharacterSelect();
+      return;
+    }
+  }
+  
+  // 2. SUMMONING CONTROLS (Must be accessible when players are NOT summoned yet)
+  if (key == 'w' && !p1Summoned && p1 != null) {
+    p1Summoned = true;
+    if (p1.idleVid != null) p1.idleVid.loop();
+    //println("SYS: Player 1 Summoned");
+  }
+
+  if (key == 'i' && !p2Summoned && p2 != null) {
+    p2Summoned = true;
+    if (p2.idleVid != null) p2.idleVid.loop();
+    //println("SYS: Player 2 Summoned");
+  }
+  
+  // 3. COMBAT CONTROLS (Only run if BOTH are active on the field)
+  if (p1Summoned && p2Summoned && p1 != null && p2 != null) {
+    
+    // Player 1 Dodge
+    if (key == 'd' && p1Stamina >= 100 && !p1.isDead && !p1.isDizzy()) { 
+        p1.tryDodge(); p1IsDodging = true; p1IsAttacking = false;
+        p1.idleVid.stop(); p1.atkVid.stop(); p1.dgeVid.jump(0); p1.dgeVid.play();
+    }
+    // Player 2 Dodge
+    if (key == 'l' && p2Stamina >= 100 && !p2.isDead && !p2.isDizzy()) { 
+        p2.tryDodge(); p2IsDodging = true; p2IsAttacking = false;
+        p2.idleVid.stop(); p2.atkVid.stop(); p2.dgeVid.jump(0); p2.dgeVid.play();
+    }
+  
+    // Player 1 Attack
+    if (key == 'a' && !p1IsAttacking && !p1IsDodging && !p1.isDead && !p1.isDizzy()) {
+      if (millis() - p1.lastAtk > p1.getInterval() * 1000) {
+        p1IsAttacking = true; p1.lastAtk = millis();
+        p1.idleVid.stop(); p1.atkVid.speed(p1.getSpeedMult()); p1.atkVid.jump(0); p1.atkVid.play();
+        p1.launchAttack(p2);
+      }
+    }
+    // Player 2 Attack
+    if (key == 'j' && !p2IsAttacking && !p2IsDodging && !p2.isDead && !p2.isDizzy()) {
+      if (millis() - p2.lastAtk > p2.getInterval() * 1000) {
+        p2IsAttacking = true; p2.lastAtk = millis();
+        p2.idleVid.stop(); p2.atkVid.speed(p2.getSpeedMult()); p2.atkVid.jump(0); p2.atkVid.play();
+        p2.launchAttack(p1);
+      }
+    }
+  }
+}
+
+void drawChar(Player p, boolean summ, boolean atking, boolean dodging, float x, float y) { 
+  if (!summ && !p.isDead) { fill(10); rect(x, y, sideWidth, videoHeight); return; } 
+  
+  float speed = p.getSpeedMult();
+  
+  if (p.isDead) {
+    if (!p.koFinished) {
+      if (p.koVid.time() >= p.koVid.duration() - 0.2 && p.koVid.duration() > 0) {
+        p.koVid.stop();
+        p.koFinished = true;
+      } else if (p.koVid.width > 0 && p.koVid.height > 0) {
+        image(p.koVid, x, y, sideWidth, videoHeight);
+      }
+    } else {
+      fill(0); rect(x, y, sideWidth, videoHeight);
+    }
+  } else if (dodging) {
+    p.dgeVid.speed(speed);
+    if (p.dgeVid.duration() > 0 && p.dgeVid.time() >= p.dgeVid.duration() - 0.2) { 
+      p.dgeVid.stop(); 
+      if (p.id == 1) p1IsDodging = false; else p2IsDodging = false; 
+      p.idleVid.loop(); 
+    } 
+    if (p.dgeVid.width > 0 && p.dgeVid.height > 0) image(p.dgeVid, x, y, sideWidth, videoHeight);
+  } else if (atking) { 
+    p.atkVid.speed(speed);
+    if (p.atkVid.duration() > 0 && p.atkVid.time() >= p.atkVid.duration() - 0.2) { 
+      p.atkVid.stop(); 
+      if (p.id == 1) p1IsAttacking = false; else p2IsAttacking = false; 
+      p.idleVid.loop(); 
+    } 
+    if (p.atkVid.width > 0 && p.atkVid.height > 0) image(p.atkVid, x, y, sideWidth, videoHeight); 
+  } else { 
+    p.idleVid.speed(speed);
+    if (p.idleVid.duration() > 0 && p.idleVid.time() >= p.idleVid.duration() - 0.1) {
+       p.idleVid.jump(0); p.idleVid.play();
+    }
+    if (p.idleVid.width > 0 && p.idleVid.height > 0) image(p.idleVid, x, y, sideWidth, videoHeight); 
+  } 
+}
+
+void calculateLayout() { 
+  sideWidth = width/2.0; 
+  videoHeight = sideWidth*(9.0/16.0); 
+  // Move log and loadout further down to make room for the HUD
+  logY = videoHeight + 50; 
+  loadoutY = logY + 130; 
+  libraryY = height - 70; 
+}
+void movieEvent(Movie m) { if (m.available()) m.read(); }
+
+color getEffectColor(String procStr) {
+  if (procStr.equals("")) return color(200);
+  
+  // Offensive Types -> Orange
+  if (procStr.contains("God of Thunder") || procStr.contains("Rightful King") || 
+      procStr.contains("Infernal Dominion") || procStr.contains("Harvest of Death") || 
+      procStr.contains("Overload") || procStr.contains("Thorny Spikes") || 
+      procStr.contains("Blood Thirsty")) {
+      return color(255, 140, 0); 
+  }
+  // Defensive Types -> Blue
+  if (procStr.contains("Vanish") || procStr.contains("Nine Yang Sutra")) {
+      return color(50, 150, 255); 
+  }
+  // Status Types -> Yellow
+  if (procStr.contains("Eternal Spring") || procStr.contains("Super Armor") || 
+      procStr.contains("Frenzy") || procStr.contains("Bless from God") || 
+      procStr.contains("Life Magic")) {
+      return color(255, 220, 0); 
+  }
+  return color(200); // System defaults
+}
+
+void logCombat(String mainText, int phys, int mag, int trueD, int heal, String proc, color typeCol) { 
+  color effColor = getEffectColor(proc);
+  combatLog.add(new LogEntry(mainText, phys, mag, trueD, heal, proc, typeCol, effColor)); 
+  if (combatLog.size() > 100) combatLog.remove(0); 
+  logScroll = 999999; 
+}
+
+void drawCombatLog(float y) { 
+  float w = 360; 
+  float h = 120;
+  float x = width/2 - w/2;
+  
+  fill(0, 180); stroke(80); strokeWeight(2); rect(x, y, w, h, 10); noStroke();
+  
+  float rowHeight = 20;
+  float totalContentHeight = combatLog.size() * rowHeight;
+  
+  logMaxScroll = max(0, totalContentHeight - (h - 20)); 
+  logScroll = constrain(logScroll, 0, logMaxScroll);
+  
+  clip(x + 5, y + 5, w - 10, h - 10); 
+  
+  textSize(11); textAlign(LEFT, CENTER);
+  float startY = y + 15 - logScroll;
+  
+  for (int i=0; i<combatLog.size(); i++) { 
+    LogEntry le = combatLog.get(i); 
+    float currentY = startY + (i * rowHeight);
+    
+    if (i % 2 == 0) {
+      fill(255, 10);
+      rect(x + 5, currentY - rowHeight/2, w - 10, rowHeight);
+    }
+    
+    //Column 1: Main action
+    fill(le.mainCol); text(le.main, x + 12, currentY); 
+  
+    // Column 2: Compounded Inline Value Blocks
+    float cursorX = x + 115;
+    
+    if (le.physDmg > 0) {
+      fill(255, 50, 50); // Physical -> Red
+      String txt = "[" + le.physDmg + " P] ";
+      text(txt, cursorX, currentY); cursorX += textWidth(txt);
+    }
+    if (le.magDmg > 0) {
+      fill(160, 50, 255); // Magical -> Purple
+      String txt = "[" + le.magDmg + " M] ";
+      text(txt, cursorX, currentY); cursorX += textWidth(txt);
+    }
+    if (le.trueDmg > 0) {
+      fill(255); // True Damage -> White
+      String txt = "{" + le.trueDmg + " T} ";
+      text(txt, cursorX, currentY); cursorX += textWidth(txt);
+    }
+    if (le.healVal > 0) {
+      fill(50, 230, 100); // Lifesteal/Regen -> Green
+      String txt = "[+" + le.healVal + " H] ";
+      text(txt, cursorX, currentY);
+    }
+  
+    // Column 3: Procs (Pushed to the right flank)
+    fill(le.effCol); 
+    text(le.effect, x + 250, currentY);
+  }
+  noClip(); 
+  
+  if (logMaxScroll > 0) {
+    float sbH = max(20, h * (h / totalContentHeight));
+    float sbY = y + 5 + map(logScroll, 0, logMaxScroll, 0, h - 10 - sbH);
+    fill(100); rect(x + w - 8, sbY, 3, sbH, 2);
+  }
+}
+
+void mouseWheel(MouseEvent event) {
+  float e = event.getCount();
+  float w = 320; 
+  float h = 120;
+  float x = width/2 - w/2;
+  
+  if (mouseX >= x && mouseX <= x + w && mouseY >= logY && mouseY <= logY + h) {
+    logScroll += e * 20; 
+  }
+}
+
+void drawDominanceIndicators() {
+  float boxSize = 50;
+  float cornerRadius = 8;
+  float yPos = height - boxSize - 20; 
+  
+  float p1X = 20;                  
+  float p2X = width - boxSize - 20; 
+  
+  // ---------------------------------------------
+  // PLAYER 1 RELATIONSHIP DETERMINATION
+  // ---------------------------------------------
+  color p1BorderColor = color(50); // Default dark frame for unsummoned characters
+  String p1StatusText = "HIDDEN";
+  PImage p1Img = null;
+  
+  // ONLY run the matching system logic if BOTH characters are active on field!
+  if (p1Summoned && p2Summoned) {
+    p1StatusText = "NEUTRAL";
+    p1BorderColor = color(80);
+    p1Img = getDominanceIcon(p1.type);
+    
+    boolean p1WinsHex = (p1.type.equalsIgnoreCase("Thunder") && p2.type.equalsIgnoreCase("Water")) ||
+                        (p1.type.equalsIgnoreCase("Water")   && p2.type.equalsIgnoreCase("Fire")) ||
+                        (p1.type.equalsIgnoreCase("Fire")    && p2.type.equalsIgnoreCase("Earth")) ||
+                        (p1.type.equalsIgnoreCase("Earth")   && p2.type.equalsIgnoreCase("Thunder"));
+                        
+    boolean p1LosesHex = (p2.type.equalsIgnoreCase("Thunder") && p1.type.equalsIgnoreCase("Water")) ||
+                         (p2.type.equalsIgnoreCase("Water")   && p1.type.equalsIgnoreCase("Fire")) ||
+                         (p2.type.equalsIgnoreCase("Fire")    && p1.type.equalsIgnoreCase("Earth")) ||
+                         (p2.type.equalsIgnoreCase("Earth")   && p1.type.equalsIgnoreCase("Thunder"));
+  
+    boolean mutualChaos = (p1.type.equalsIgnoreCase("Holy") && p2.type.equalsIgnoreCase("Dark")) ||
+                          (p1.type.equalsIgnoreCase("Dark") && p2.type.equalsIgnoreCase("Holy"));
+ 
+    if (p1WinsHex) {
+        p1BorderColor = color(255, 50, 50); // Red for dominance
+        p1StatusText = "DOMINANT";
+    } else if (p1LosesHex) {
+        p1BorderColor = color(50, 150, 255); // Blue for weakness
+        p1StatusText = "WEAKNESS";
+    } else if (mutualChaos) {
+        p1BorderColor = color(255, 100, 255); // Purple for chaos
+        p1StatusText = "CHAOS";
+    }
+  } else if (p1Summoned) {
+    p1StatusText = "READY";
+    p1BorderColor = color(150);
+    p1Img = getDominanceIcon(p1.type);
+  }
+  
+  // Draw P1 Base Box with a thicker, glowing border ring
+  fill(20, 220); 
+  stroke(p1BorderColor); 
+  strokeWeight(3); // Increased weight to create a glowing frame
+  rect(p1X, yPos, boxSize, boxSize, cornerRadius);
+  
+  // Render Player 1's Graphic Asset (No tints — renders beautifully clean!)
+  if (p1Img != null && p1Img.width > 0) {
+    noStroke();
+    image(p1Img, p1X + 3, yPos + 3, boxSize - 6, boxSize - 6);
+  }
+  
+  // Status Labels Overlay inside the box
+  noStroke(); 
+  fill(0, 150); 
+  rect(p1X + 3, yPos + boxSize - 16, boxSize - 6, 12, 4);
+  fill(255); 
+  textSize(9); 
+  textAlign(CENTER, CENTER);
+  text(p1StatusText, p1X + boxSize/2, yPos + boxSize - 11);
+
+
+  // ---------------------------------------------
+  // PLAYER 2 RELATIONSHIP DETERMINATION
+  // ---------------------------------------------
+  color p2BorderColor = color(50); 
+  String p2StatusText = "N/A";
+  PImage p2Img = null;
+  
+  if (p1Summoned && p2Summoned) {
+    p2StatusText = "NEUTRAL";
+    p2BorderColor = color(80);
+    p2Img = getDominanceIcon(p2.type);
+    
+    boolean p1WinsHex = (p1.type.equalsIgnoreCase("Thunder") && p2.type.equalsIgnoreCase("Water")) ||
+                        (p1.type.equalsIgnoreCase("Water")   && p2.type.equalsIgnoreCase("Fire")) ||
+                        (p1.type.equalsIgnoreCase("Fire")    && p2.type.equalsIgnoreCase("Earth")) ||
+                        (p1.type.equalsIgnoreCase("Earth")   && p2.type.equalsIgnoreCase("Thunder"));
+                        
+    boolean p1LosesHex = (p2.type.equalsIgnoreCase("Thunder") && p1.type.equalsIgnoreCase("Water")) ||
+                         (p2.type.equalsIgnoreCase("Water")   && p1.type.equalsIgnoreCase("Fire")) ||
+                         (p2.type.equalsIgnoreCase("Fire")    && p1.type.equalsIgnoreCase("Earth")) ||
+                         (p2.type.equalsIgnoreCase("Earth")   && p1.type.equalsIgnoreCase("Thunder"));
+  
+    boolean mutualChaos = (p1.type.equalsIgnoreCase("Holy") && p2.type.equalsIgnoreCase("Dark")) ||
+                          (p1.type.equalsIgnoreCase("Dark") && p2.type.equalsIgnoreCase("Holy"));
+
+    if (p1LosesHex) { 
+        p2BorderColor = color(255, 50, 50); // Red for dominance
+        p2StatusText = "DOMINANT";
+    } else if (p1WinsHex) { 
+        p2BorderColor = color(50, 150, 255); // Blue for weakness
+        p2StatusText = "WEAKNESS";
+    } else if (mutualChaos) {
+        p2BorderColor = color(255, 100, 255); // Purple for chaos
+        p2StatusText = "CHAOS";
+    }
+  } else if (p2Summoned) {
+    p2StatusText = "READY";
+    p2BorderColor = color(150);
+    p2Img = getDominanceIcon(p2.type);
+  }
+  
+  // Draw P2 Base Box with a thicker, glowing border ring
+  fill(20, 220); 
+  stroke(p2BorderColor); 
+  strokeWeight(3); // Increased weight to create a glowing frame
+  rect(p2X, yPos, boxSize, boxSize, cornerRadius);
+  
+  // Render Player 2's Graphic Asset (No tints!)
+  if (p2Img != null && p2Img.width > 0) {
+    noStroke();
+    image(p2Img, p2X + 3, yPos + 3, boxSize - 6, boxSize - 6);
+  }
+  
+  // Status Labels Overlay inside the box
+  noStroke(); 
+  fill(0, 150); 
+  rect(p2X + 3, yPos + boxSize - 16, boxSize - 6, 12, 4);
+  fill(255); 
+  textSize(9); 
+  textAlign(CENTER, CENTER);
+  text(p2StatusText, p2X + boxSize/2, yPos + boxSize - 11);
+  
+  textAlign(LEFT, BASELINE); // Reset alignment defaults[cite: 2]
+}
+
+void drawEffectSummary(Player p, float x, float y) { 
+  fill(0, 180); noStroke(); rect(x, y, 200, 120, 10); 
+  fill(140, 200, 255); textSize(10); text("PASSIVES:", x+10, y+20); 
+  int activeLines = 0;
+  for (int i=0; i<4; i++) { 
+    if (p.items[i] >= 0 && p.items[i] < allItemNames.length) { 
+      fill(200); text("• " + getEffectDesc(allItemNames[p.items[i]]), x+10, y+40+(activeLines*15)); 
+      activeLines++;
+    } 
+  } 
+}
+
+String getEffectDesc(String n) { 
+  switch(n) { 
+    // --- OFFENSIVE & ACCELERATION GEAR ---
+    case "Mjölnir":                           return "+150 Phys atk, +10% atk spd"; 
+    case "Excalibur":                         return "+200 phys atk, +50 true dmg"; 
+    case "Crimson_Bloodreaver":               return "+15% life steal, +15% atk spd";
+    case "Bursting_Scepter":                  return "+100 mag atk, +10% life steal";
+    case "Reaper_Sickle":                     return "+125 true dmg, 15% atk spd";
+    case "Crown_of_Ember_Sovereign":          return "+30% mag dmg, 10% atk spd";
+    case "Grimoire_d'Archimage":              return "+200 mag dmg, +50 true dmg";
+
+    // --- DEFENSIVE & SUSTAIN GEAR ---
+    case "Heart_of_Verdant_Core":             return "+200 max HP, +10% dizzy redu"; 
+    case "Golden_Bell_Shield_and_Iron_Cloth": return "+20% phys redu, +400 max HP"; 
+    case "Paladin's_Shield":                  return "+300 max HP, +150 phys redu";
+    case "Cloak_of_Midnight":                 return "15% mag redu, 5% dizzy redu";
+    case "Warden's_Thornplate":               return "+200 phys redu, +200 mag redu";
+    case "Blood_of_Satan":                    return "+50 true atk, +25% atk spd";
+    case "Holy_Water":                        return "+10% dizzy redu, +10% all redu";
+    default: return n.replace("_", " "); 
+  } 
+}
+
+void drawLoadoutSlots(float y) { 
+  float s=50, sp=10; 
+  for(int i=0; i<4; i++) { 
+    fill(30); stroke(80); rect(60+i*(s+sp), y, s, s, 8); 
+    if(p1Loadout[i]!=-1) image(allImages[p1Loadout[i]], 65+i*(s+sp), y+5, s-10, s-10); 
+    fill(30); rect(width-300+i*(s+sp), y, s, s, 8); 
+    if(p2Loadout[i]!=-1) image(allImages[p2Loadout[i]], width-295+i*(s+sp), y+5, s-10, s-10); 
+  } 
+}
+
+void drawLibrary(float y) { 
+  float s=40, sp=5; 
+  for(int i=0; i<14; i++) { 
+    fill(30); noStroke(); rect(width/2-320+i*(s+sp), y, s, s, 5); 
+    if(allImages[i]!=null) image(allImages[i], width/2-315+i*(s+sp), y+5, s-10, s-10); 
+  } 
+}
+
+void mousePressed() { 
+  float s_lib=40, sp_lib=5; 
+  for(int i=0; i<14; i++) { 
+    float x=width/2-320+i*(s_lib+sp_lib); 
+    if(mouseX >= x && mouseX <= x+s_lib && mouseY >= libraryY && mouseY <= libraryY+s_lib) { draggedItemIdx = i; return; } 
+  } 
+  float s_ld=50, sp_ld=10; 
+  for(int i=0; i<4; i++) { 
+    float p1x = 60+i*(s_ld+sp_ld); 
+    if(mouseX >= p1x && mouseX <= p1x+s_ld && mouseY >= loadoutY && mouseY <= loadoutY+s_ld) { 
+      if (p1Loadout[i] != -1) { draggedItemIdx = p1Loadout[i]; draggingFromP1 = true; dragSourceSlot = i; return; } 
+    } 
+    float p2x = width-300+i*(s_ld+sp_ld); 
+    if(mouseX >= p2x && mouseX <= p2x+s_ld && mouseY >= loadoutY && mouseY <= loadoutY+s_ld) { 
+      if (p2Loadout[i] != -1) { draggedItemIdx = p2Loadout[i]; draggingFromP2 = true; dragSourceSlot = i; return; } 
+    } 
+  } 
+}
+
+void mouseReleased() { 
+  if(draggedItemIdx == -1) return; 
+  float s_ld=50, sp_ld=10; boolean droppedInSlot = false; 
+  for(int i=0; i<4; i++) { 
+    float p1x = 60+i*(s_ld+sp_ld); 
+    if(mouseX >= p1x && mouseX <= p1x+s_ld && mouseY >= loadoutY && mouseY <= loadoutY+s_ld) { 
+      p1Loadout[i]=draggedItemIdx; droppedInSlot=true; 
+      if (draggingFromP1 && dragSourceSlot != i) p1Loadout[dragSourceSlot] = -1; else if (draggingFromP2) p2Loadout[dragSourceSlot] = -1; 
+    } 
+    float p2x = width-300+i*(s_ld+sp_ld); 
+    if(mouseX >= p2x && mouseX <= p2x+s_ld && mouseY >= loadoutY && mouseY <= loadoutY+s_ld) { 
+      p2Loadout[i]=draggedItemIdx; droppedInSlot=true; 
+      if (draggingFromP2 && dragSourceSlot != i) p2Loadout[dragSourceSlot] = -1; else if (draggingFromP1) p1Loadout[dragSourceSlot] = -1; 
+    } 
+  } 
+  if(!droppedInSlot && (draggingFromP1 || draggingFromP2)) { 
+    if(draggingFromP1) p1Loadout[dragSourceSlot] = -1; if(draggingFromP2) p2Loadout[dragSourceSlot] = -1; 
+  } 
+  
+  p1.sync(p1Loadout);
+  p2.sync(p2Loadout);
+  
+  draggedItemIdx = -1; draggingFromP1 = false; draggingFromP2 = false; dragSourceSlot = -1; 
+}
+
+PImage getDominanceIcon(String archetype) {
+  for (int i = 0; i < codArchetypes.length; i++) {
+    if (codArchetypes[i].equalsIgnoreCase(archetype)) {
+      return codImages[i];
+    }
+  }
+  return null; // Fallback if type doesn't match
+}
+
+void resetToCharacterSelect() {
+  p1Summoned = false;
+  p2Summoned = false;
+  p1IsAttacking = false;
+  p2IsAttacking = false;
+  p1IsDodging = false;
+  p2IsDodging = false;
+  
+  p1Stamina = 100;
+  p2Stamina = 100;
+  
+  if (p1 != null) {
+    p1.resetPlayer();
+  }
+  if (p2 != null) {
+    p2.resetPlayer();
+  }
+  
+  combatLog.clear();
+  logScroll = 0;
+  logMaxScroll = 0;
+  
+  //println("SYS: Match states cleaned. Players reset. Ready for fresh character selection.");
+}
